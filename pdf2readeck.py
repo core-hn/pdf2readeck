@@ -446,15 +446,21 @@ def extract_structured_content(pdf_path: str) -> dict:
             doc = fitz.open(pdf_path)
             for page_num, page in enumerate(doc):
                 for idx, img in enumerate(page.get_images(full=True)):
-                    xref = img[0]
-                    pix  = fitz.Pixmap(doc, xref)
-                    if pix.n - pix.alpha > 3:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
-                    result["images"].append({
-                        "id": f"img_p{page_num}_{idx}", "b64": b64,
-                        "mime": "image/png", "page": page_num,
-                    })
+                    try:
+                        xref = img[0]
+                        pix  = fitz.Pixmap(doc, xref)
+                        # Convertir tout ce qui n'est pas RGB ou grayscale
+                        if pix.colorspace and pix.colorspace.n > 3:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        elif pix.alpha:
+                            pix = fitz.Pixmap(pix, 0)  # supprime le canal alpha
+                        b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+                        result["images"].append({
+                            "id": f"img_p{page_num}_{idx}", "b64": b64,
+                            "mime": "image/png", "page": page_num,
+                        })
+                    except Exception:
+                        continue  # image non convertible, on passe
             doc.close()
         ok("Images extraites", f"{len(result['images'])} image(s)")
     except ImportError:
