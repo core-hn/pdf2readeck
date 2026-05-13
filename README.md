@@ -26,7 +26,7 @@ cp env.example .env
 ```
 
 ```env
-READECK_URL=https://readeck.abbadie.ovh
+READECK_URL=https://ton_serveur_readeck.fr/org/net
 READECK_TOKEN=ton_token_ici
 ```
 
@@ -56,15 +56,15 @@ $ python pdf2readeck.py
 
   ·  Chemin local (relatif ou absolu) ou URL directe vers un PDF
 
-  ›  Source PDF  ~/Documents/gajjala2002.pdf
+  ›  Source PDF  ~/Documents/example.pdf
 
   ·  DOI ou URL de l'article auquel rattacher ce PDF
 
-  ›  URL de citation  https://doi.org/10.1080/14680770220150854
+  ›  URL de citation  https://lien_vers_article.fr/
 
   ·  Labels Readeck (séparés par des virgules, laisser vide pour ignorer)
 
-  ›  Labels  cyberethnographie, féminisme, lecture
+  ›  Labels  tag1, tag2, tag3
 
   ──  Analyse  ────────────────────────────────────────
 
@@ -80,7 +80,7 @@ $ python pdf2readeck.py
   ✔  Patch colonnes activé
 ```
 
-Le script reconnaît automatiquement si la source est un chemin local (relatif `./article.pdf`, absolu `/home/axelle/docs/article.pdf`, avec `~`) ou une URL.
+Le script reconnaît automatiquement si la source est un chemin local (relatif `./article.pdf`, absolu `/home/user/docs/article.pdf`, avec `~`) ou une URL.
 
 ### Mode CLI (pour scripts et automatisation)
 
@@ -88,18 +88,18 @@ Le script reconnaît automatiquement si la source est un chemin local (relatif `
 # PDF local
 python pdf2readeck.py \
   --source article.pdf \
-  --url https://doi.org/10.1080/14680770220150854
+  --url https://lien_vers_article.fr/
 
 # PDF distant
 python pdf2readeck.py \
   --source https://example.org/article.pdf \
-  --url https://doi.org/10.xxxx/yyyy
+  --url https://lien_vers_article.fr
 
 # Avec titre et labels forcés
 python pdf2readeck.py \
   --source article.pdf \
   --url https://doi.org/10.xxxx/yyyy \
-  --title "Gajjala 2002 — Cyberethnographie féministe" \
+  --title "Titre rédigé à la main" \
   --labels cyberethnographie féminisme lecture
 ```
 
@@ -135,6 +135,9 @@ python pdf2readeck.py \
 ---
 
 ## Changelog
+
+### v0.2.3
+- Script pdf2readeck.sh : permet de créer l'env conda, de lancer l'utilitaire, puis de détruire l'env conda créé pendant le script.
 
 ### v0.2.2
 - Détection interactive des anomalies PDF avec proposition de patchs :
