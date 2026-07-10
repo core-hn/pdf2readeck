@@ -14,7 +14,9 @@ __version__ = "0.2.2"
 import argparse
 import base64
 import collections
+import concurrent.futures
 import itertools
+import json
 import os
 import re
 import sys
@@ -32,10 +34,25 @@ load_dotenv()
 READECK_URL   = os.getenv("READECK_URL", "").rstrip("/")
 READECK_TOKEN = os.getenv("READECK_TOKEN", "")
 
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.getenv(
+    "OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+)
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_TIMEOUT  = int(os.getenv("OPENROUTER_TIMEOUT", "420"))
+
 # Seuils de détection
 ROTATION_CHAR_THRESHOLD = 50    # nb minimum de chars rotatifs pour déclencher l'alerte
 ROTATION_MATRIX_EPSILON = 0.1   # abs(matrix[1]) > seuil => char considéré rotatif
 BIMODAL_COLUMN_RATIO    = 0.15  # creux dans l'histogramme X < ratio du max => bimodal
+
+# Lots de traduction (regroupement de blocs par requête LLM)
+# Des lots plus gros réduisent le nombre de requêtes — le principal facteur
+# de lenteur étant le coût fixe par appel (latence + raisonnement du modèle),
+# pas la taille du contenu traduit.
+TRANSLATE_BATCH_MAX_ITEMS  = 60
+TRANSLATE_BATCH_MAX_CHARS  = 12000
+TRANSLATE_MAX_CONCURRENCY = int(os.getenv("TRANSLATE_MAX_CONCURRENCY", "5"))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -197,6 +214,24 @@ def resolve_pdf(source: str) -> str:
 
 # ── Détection d'anomalies ─────────────────────────────────────────
 
+def _dedupe_chars(chars: list) -> list:
+    """
+    Supprime les caractères redessinés plusieurs fois à la même position.
+    Certains PDF (scans/réimpressions) empâtent le texte en repeignant
+    chaque glyphe plusieurs fois au pixel près, ce qui multiplie le nombre
+    de caractères extraits (et donc la taille du contenu) sans rien ajouter.
+    """
+    seen = set()
+    result = []
+    for ch in chars:
+        key = (ch.get("text"), round(ch.get("x0", 0), 1), round(ch.get("top", 0), 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(ch)
+    return result
+
+
 def _is_rotated(ch: dict) -> bool:
     """Retourne True si le caractère a une matrice de transformation rotative."""
     matrix = ch.get("matrix")
@@ -351,7 +386,7 @@ def extract_structured_content(pdf_path: str) -> dict:
             pages_data  = []   # list of (chars, page_width)
 
             for page in pdf.pages:
-                chars      = page.chars or []
+                chars      = _dedupe_chars(page.chars or [])
                 page_width = float(page.width or 600)
                 all_chars.extend(chars)
                 pages_data.append((chars, page_width))
@@ -411,7 +446,7 @@ def extract_structured_content(pdf_path: str) -> dict:
             page_lines_all     = []
 
             for page in pdf.pages:
-                chars      = page.chars or []
+                chars      = _dedupe_chars(page.chars or [])
                 page_width = float(page.width or 600)
 
                 # Patch rotation
@@ -469,6 +504,26 @@ def extract_structured_content(pdf_path: str) -> dict:
     return result
 
 
+def cache_extracted_content(content: dict) -> str:
+    """
+    Sauvegarde les blocs extraits (hors images) dans un fichier JSON temporaire.
+    Filet de sécurité : si une étape ultérieure (traduction, envoi) plante,
+    l'extraction — souvent longue et interactive — n'est pas à refaire.
+    """
+    cache = {
+        "title":  content["title"],
+        "author": content["author"],
+        "blocks": content["blocks"],
+    }
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="pdf2readeck_",
+        delete=False, encoding="utf-8"
+    )
+    with tmp:
+        json.dump(cache, tmp, ensure_ascii=False, indent=2)
+    return tmp.name
+
+
 # ══════════════════════════════════════════════════════════════════
 #  HTML
 # ══════════════════════════════════════════════════════════════════
@@ -510,6 +565,210 @@ def build_html(content: dict, citation_url: str, title_override: str = "") -> st
 {"".join(body_html)}
 </body>
 </html>"""
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TRADUCTION (OpenRouter)
+# ══════════════════════════════════════════════════════════════════
+
+def _build_translation_context(title: str, target_lang: str) -> str:
+    doc_ref = f" intitulé « {title} »" if title else ""
+    return (
+        f"Tu traduis des extraits consécutifs d'un document académique{doc_ref} "
+        f"vers la langue « {target_lang} ». La traduction sert à saisir le sens en "
+        f"lecture, pas à produire un texte de référence : privilégie la fluidité et "
+        f"la fidélité du sens plutôt que la littéralité. Les segments sont donnés "
+        f"dans leur ordre d'apparition dans le document ; garde la cohérence "
+        f"(reprises, temps verbaux, terminologie) avec ce contexte global."
+    )
+
+
+def _chunk_texts(texts: list) -> list:
+    """Découpe une liste de textes en lots pour limiter la taille des requêtes LLM."""
+    batches = []
+    current       = []
+    current_chars = 0
+
+    for text in texts:
+        text_len = len(text)
+        if current and (
+            len(current) >= TRANSLATE_BATCH_MAX_ITEMS
+            or current_chars + text_len > TRANSLATE_BATCH_MAX_CHARS
+        ):
+            batches.append(current)
+            current       = []
+            current_chars = 0
+        current.append(text)
+        current_chars += text_len
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _translate_batch(texts: list, target_lang: str, context: str,
+                      on_delta=None) -> list:
+    """
+    Traduit un lot de segments via OpenRouter, en streaming.
+    Le streaming sert à la fois à afficher une progression réelle et à
+    pouvoir imposer un délai global : OpenRouter envoie des commentaires
+    keep-alive périodiques sur les requêtes non-streamées, ce qui empêche
+    un timeout de lecture classique (`requests.post(timeout=...)`) de se
+    déclencher même après plusieurs dizaines de minutes.
+    """
+    numbered     = "\n".join(f"{i + 1}: {t}" for i, t in enumerate(texts))
+    instructions = (
+        "Réponds uniquement avec les traductions, un segment par ligne, dans le "
+        "même ordre, au format \"N :: traduction\" (N étant le numéro du segment). "
+        "N'ajoute aucun commentaire, aucune explication, aucun texte avant ou "
+        "après la liste."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": f"{context}\n\n{instructions}"},
+            {"role": "user",   "content": numbered},
+        ],
+        "temperature": 0.2,
+        # Tâche mécanique de traduction : le raisonnement n'apporte rien et
+        # gonfle le nombre de tokens de sortie (donc la latence) inutilement.
+        "reasoning": {"enabled": False},
+        "stream": True,
+    }
+
+    started = time.monotonic()
+    parts   = []
+
+    try:
+        with requests.post(
+            OPENROUTER_ENDPOINT, headers=headers, json=payload,
+            timeout=(10, 60), stream=True
+        ) as response:
+            if response.status_code != 200:
+                warn(f"Lot non traduit (erreur OpenRouter {response.status_code})",
+                     response.text[:120])
+                return texts
+
+            for raw_bytes in response.iter_lines():
+                if time.monotonic() - started > OPENROUTER_TIMEOUT:
+                    warn("Lot abandonné (délai global dépassé)",
+                         f"{OPENROUTER_TIMEOUT}s")
+                    return texts
+
+                if not raw_bytes:
+                    continue
+                # Décodage explicite en UTF-8 : `decode_unicode=True` s'appuie
+                # sur response.encoding, que requests devine souvent mal pour
+                # les flux SSE (fallback ISO-8859-1), ce qui mojibake les accents.
+                raw_line = raw_bytes.decode("utf-8", errors="replace")
+                if not raw_line.startswith("data: "):
+                    continue
+                data = raw_line[len("data: "):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content") or ""
+                if delta:
+                    parts.append(delta)
+                    if on_delta:
+                        on_delta(len(delta))
+    except requests.exceptions.RequestException as e:
+        warn("Lot non traduit (erreur réseau OpenRouter)", str(e)[:120])
+        return texts
+    except Exception as e:
+        # Un lot ne doit jamais faire planter toute la traduction : une forme
+        # de réponse imprévue côté API doit dégrader ce lot, pas le script.
+        warn("Lot non traduit (erreur inattendue)", str(e)[:120])
+        return texts
+
+    reply = "".join(parts)
+
+    translated = {}
+    for line in reply.splitlines():
+        match = re.match(r"\s*(\d+)\s*::\s*(.*)$", line)
+        if match:
+            idx, text = match.groups()
+            translated[int(idx)] = text.strip()
+
+    return [translated.get(i + 1, texts[i]) for i in range(len(texts))]
+
+
+def _translate_texts(texts: list, target_lang: str, context: str) -> list:
+    if not texts:
+        return []
+    if not OPENROUTER_API_KEY:
+        die("OpenRouter non configuré", "OPENROUTER_API_KEY manquant dans .env")
+
+    batches        = _chunk_texts(texts)
+    nb_batches     = len(batches)
+    results        = [None] * nb_batches
+    done           = 0
+    chars_received = 0
+    lock           = threading.Lock()
+
+    def progress_label() -> str:
+        return (f"Traduction ({done}/{nb_batches} lots  ·  "
+                f"{TRANSLATE_MAX_CONCURRENCY} en parallèle  ·  "
+                f"{chars_received:,} caractères reçus)")
+
+    def on_delta(n: int) -> None:
+        nonlocal chars_received
+        with lock:
+            chars_received += n
+            spinner.label = progress_label()
+
+    with Spinner(progress_label()) as spinner:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=TRANSLATE_MAX_CONCURRENCY
+        ) as executor:
+            futures = {
+                executor.submit(_translate_batch, batch, target_lang, context, on_delta): i
+                for i, batch in enumerate(batches)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                i = futures[future]
+                results[i] = future.result()
+                with lock:
+                    done += 1
+                    spinner.label = progress_label()
+
+    ok(f"{nb_batches} lot(s) traduits")
+
+    translated = []
+    for batch_result in results:
+        translated.extend(batch_result)
+    return translated
+
+
+def translate_content(content: dict, title: str, target_lang: str) -> tuple:
+    """Traduit les blocs de contenu et le titre. Retourne (content, titre_traduit)."""
+    block_texts = [b["text"] for b in content["blocks"]]
+    all_texts   = block_texts + ([title] if title else [])
+    context     = _build_translation_context(title, target_lang)
+
+    info(f"Traduction vers « {target_lang} »", OPENROUTER_MODEL)
+    p()
+    translated = _translate_texts(all_texts, target_lang, context)
+
+    nb_blocks = len(block_texts)
+    for block, text in zip(content["blocks"], translated[:nb_blocks]):
+        block["text"] = text
+    new_title = translated[nb_blocks] if title else title
+
+    ok("Contenu traduit", f"{nb_blocks} blocs → {target_lang}")
+    return content, new_title
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -579,6 +838,8 @@ def main() -> None:
     parser.add_argument("--title", "-t", default="", help="Titre du bookmark")
     parser.add_argument("--labels", "-l", nargs="*", default=[],
                         help="Labels Readeck (ex : --labels lecture these)")
+    parser.add_argument("--translate-to", "-tt", default="",
+                        help="Code langue cible pour traduire le contenu (ex : fr, en, es) via OpenRouter")
     parser.add_argument("--version", "-v",
                         action="version", version=f"pdf2readeck {__version__}")
     args = parser.parse_args()
@@ -621,7 +882,9 @@ def main() -> None:
 
     try:
         # ── Extraction + analyse + patchs interactifs
-        content = extract_structured_content(pdf_path)
+        content    = extract_structured_content(pdf_path)
+        cache_path = cache_extracted_content(content)
+        info("Contenu extrait sauvegardé (filet de sécurité)", cache_path)
 
         # ── Validation du titre
         section("Titre")
@@ -644,6 +907,21 @@ def main() -> None:
                 ok("Titre retenu", title_override)
         else:
             ok("Titre retenu", title_override)
+
+        # ── Traduction (optionnelle, via OpenRouter)
+        section("Traduction")
+        target_lang = args.translate_to
+        if not target_lang:
+            if confirm("Traduire le contenu avant l'envoi ?", default_yes=False):
+                p()
+                target_lang = prompt("Langue cible (ex : fr, en, es)")
+            else:
+                info("Traduction ignorée")
+        if target_lang:
+            p()
+            content, title_override = translate_content(
+                content, title_override, target_lang
+            )
 
         # ── Génération HTML
         section("HTML")
